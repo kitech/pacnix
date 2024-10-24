@@ -43,7 +43,7 @@ pub fn runcmdv(cmd string, wkdir ... string) []string {
 // todo pipe out or hang somewhere when too many out
 pub fn runcmd(cmd string, wkdir string, capio bool) string {
 	if !cmd.contains("/which ") && cmd != "which" {
-	vcp.info("[${cmd}]", "wkdir:", wkdir)
+		// vcp.info("[${cmd}]", "wkdir:", wkdir)
 	}
 	args := cmdline_split(cmd)
 	// vcp.info(args.str())
@@ -77,7 +77,7 @@ pub fn runcmd(cmd string, wkdir string, capio bool) string {
 			}
 		}
 	}
-	vcp.info("should done", proc.is_alive(), outbuf.len, errbuf.len, cmd)
+	// vcp.info("should done", proc.is_alive(), outbuf.len, errbuf.len, cmd)
 	proc.wait()
 	defer {proc.close()}
 
@@ -125,10 +125,13 @@ struct Cmdarg {
 
 // todo temp repack directory
 // todo depends packages resolve
-// todo linked shared library resolve
+// linked shared library resolve
+// todo max candidate lines to show option
 // todo meta data file auto update
 // todo implement nix copy, drop nix depened
-// prerequires: sudo!!! tar brotli grep
+// prerequires: sudo!!! tar brotli grep install_name_tool
+// sometimes need select package.
+// sometimes need input root password
 fn main() {
 	// mut fp := flag.new_flag_parser(os.args)
 	// fp.string("xxx", 0, "uuu", "eee", flag.FlagConfig{})
@@ -169,7 +172,7 @@ fn main() {
 	mut ino := -1
 	mut ipt := ""
 	if rcvals.len > 1 {
-		ipt = os.input("input the no in [0,${rcvals.len}] > ")
+		ipt = os.input("input the no in [0,${rcvals.len-1}] > ")
 		// vcp.info(ipt, ipt.is_digit())
 		vcp.zeroprt(ipt, "no input any no")
 		if ipt == "" || !ipt.is_digit() {}
@@ -220,6 +223,10 @@ fn main() {
 			
 			vcp.info("wkdir", os.getenv("PWD"))
 			runcmd("sudo chmod 755 -R pkgs/usr", "", false)
+
+			// resolve dlpath
+			replace_sharelib_ldpaths("pkgs/usr/local")
+
 			runcmd("fakeroot -- tar zcfp ${mydir}/${tmpgz} usr/ .PKGINFO", os.real_path( "pkgs/"), false)
 			runcmd("tar tf ${tmpgz}", "", false)
 			runcmd("ls -lh ${tmpgz}", "", false)
@@ -233,6 +240,64 @@ fn main() {
 			runcmd("sudo rm -rf pkgs/nix/var/", "", false)
 		}
 	// demo()
+}
+
+fn addassignop<T>(v T, p voidptr) T {
+	mut n := unsafe { *(&T(p)) }
+	n += v
+	unsafe { *(&T(p)) = n }
+	return n
+}
+fn replace_sharelib_ldpaths(dir string) {
+	mut spctx := 0
+	os.walk_with_context(dir, voidptr(&spctx), fn (ctx voidptr, f string) {
+		// vcp.info(f, os.is_dir(f), os.is_link(f))
+		if os.is_link(f) {
+			vcp.info(f, "=>", os.real_path(f))
+		}
+		if os.is_dir(f) || os.is_link(f) { return }
+		if !check_binarch(f) { addassignop(1, ctx)
+			// vcp.info(check_binarch(f), ctx, f)
+		}
+		replace_sharelib_ldpath(f)
+	})
+	// vcp.info("binarcherr", spctx, dir)
+	vcp.falseprt(spctx==0, "binarch not match", spctx, dir)
+}
+fn replace_sharelib_ldpath(file string) {
+	lines := runcmdv("otool -L ${file}")
+	// vcp.info(lines)
+	if lines.len < 1 { return }
+	if lines[0].contains("is not an object file") { return }
+
+	mut changed := false
+	for i:=1; i < lines.len;i++ {
+		line := lines[i].trim_space()
+		if !line.starts_with("/nix/store/") { continue }
+		vcp.info(i, "need resolve ldpath", line)
+
+		libpath := line.all_before(" ")
+		libbase := os.base(libpath)
+		newpath := "@rpath/${libbase}"
+		newpath2 := "/usr/local/lib/${libbase}"
+		// install_name_tool -change
+		runcmd("install_name_tool -change ${libpath} ${newpath} $file", "", false)
+		changed = true
+	}
+	if changed {
+		runcmd("otool -L ${file}", "", false)
+	}
+}
+
+// Mach-O 64-bit executable x86_64
+fn check_binarch(file string) bool {
+	lines := runcmdv("file ${file}")
+	filety := firstofv(lines)
+	// vcp.info(filety,  filety.contains("executable"), filety.contains("x86_64") )
+	if filety.contains("executable") && !filety.contains("x86_64") {
+		return false
+	}
+	return true
 }
 
 // line: /nix/store/imhzscw3r1rd6x40ddc5wwknwdsz6x5r-par2cmdline-0.8.1
