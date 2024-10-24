@@ -39,6 +39,8 @@ pub fn runcmdv(cmd string, wkdir ... string) []string {
 	scc := runcmd(cmd, dir, true)
 	return scc.split_into_lines()
 }
+
+// todo pipe out or hang somewhere when too many out
 pub fn runcmd(cmd string, wkdir string, capio bool) string {
 	if !cmd.contains("/which ") && cmd != "which" {
 	vcp.info("[${cmd}]", "wkdir:", wkdir)
@@ -54,16 +56,38 @@ pub fn runcmd(cmd string, wkdir string, capio bool) string {
 	if capio { proc.set_redirect_stdio() }
 	if wkdir.len > 0 { proc.set_work_folder(wkdir) }
 	proc.run()
+	mut outbuf := ""
+	mut errbuf := ""
+	if capio {
+		mut toobig := false
+		for proc.is_alive() {
+			outstr := proc.pipe_read(.stdout) or {
+				// vcp.error(err.str())
+				""}
+			if !toobig { outbuf += outstr }
+			// vcp.info("out", outstr.len, outbuf.len)
+			errstr := proc.pipe_read(.stderr) or {
+				// vcp.error(err.str())
+				"" }
+			if !toobig { errbuf += errstr }
+			// vcp.info("`${cmd}`", outstr.len, errstr.len, "buffed", outbuf.len, errbuf.len)
+			if outbuf.len + errbuf.len > 8*1024*1025 {
+				toobig = true
+				vcp.warn("out toobig", outbuf.len + errbuf.len, cmd)
+			}
+		}
+	}
+	vcp.info("should done", proc.is_alive(), outbuf.len, errbuf.len, cmd)
 	proc.wait()
 	defer {proc.close()}
 
 	// vcp.info(proc.code, proc.err, args)
 	if capio {
-		outstr := proc.stdout_read()
-		errstr := proc.stderr_read()
+		outbuf += proc.stdout_read()
+		errbuf += proc.stderr_read()
 		// vcp.info("`${cmd}`\n", outstr, errstr)
 		// vcp.info(proc.stdout_slurp())
-		return outstr+errstr
+		return outbuf+errbuf
 	}
 	return ""
 }
@@ -99,6 +123,12 @@ struct Cmdarg {
     ignore_me    string @[ignore]
 }
 
+// todo temp repack directory
+// todo depends packages resolve
+// todo linked shared library resolve
+// todo meta data file auto update
+// todo implement nix copy, drop nix depened
+// prerequires: sudo!!! tar brotli grep
 fn main() {
 	// mut fp := flag.new_flag_parser(os.args)
 	// fp.string("xxx", 0, "uuu", "eee", flag.FlagConfig{})
@@ -112,51 +142,45 @@ fn main() {
 	dump(cfg)
 
 	println('Hello World! ${os.args}, ${nomats}')
-
-	if false {
-		lines := runcmdv("ls -l -h")
-		for line in lines { vcp.info(line) }
-		return
-	}
+	// if true { return }
 
 	args := nomats
 	pkgname := args[0]
-
-	mut rcvals := []string{}
-	mut fp := os.open("store-path-head200")!
-	defer {fp.close()}
+	// store_path_file := "store-path-head200" // about 15K
+	store_path_file := "store-path" // about 11M
 	
 	vcp.info("reading store-path maybe need secs...")
-	mut buf := []u8{len:96}
-	for i:=0; !fp.eof() ;i++ {
-		rn := fp.read_bytes_with_newline(mut &buf) or {
-			vcp.error(err.str()); break}
-		line := buf[..rn].bytestr().trim_space_right()
-		// vcp.info(i, line.len, line, pkgname)
-		// vcp.info(i, rn, buf.len, line.len, line)
-		if line.len>0 && line.contains(pkgname) && line != "" {
-			vcp.info("got???", i, line.len, line)
-			rcvals << line
-		}
+	rcvals := get_match_store_paths(store_path_file, pkgname)
+	vcp.info(rcvals.len, rcvals.str().elide_right(64))
+	vcp.zeroprt(rcvals.len, "not found", pkgname, os.file_size(store_path_file))
+	if rcvals.len == 0 {
+		exit(-1)
 	}
-	vcp.info(rcvals.len, rcvals)
-	vcp.zeroprt(rcvals.len, "not found", pkgname)
-	if rcvals.len==0 {
 
-	}
+	maxoptno := 30
 	for i, line in rcvals {
 		vcp.info(i, "\t", line)
+		if i > maxoptno { break}
 	}
-	mut ino := 0
+	vcp.trueprt(rcvals.len>maxoptno, "too many matches", rcvals.len, pkgname, "file size:", os.file_size(store_path_file))
+	if rcvals.len > maxoptno {
+		exit(-1)
+	}
+	mut ino := -1
+	mut ipt := ""
 	if rcvals.len > 1 {
-		ipt := os.input("input the no in [0,${rcvals.len}] > ")
-		vcp.info(ipt)
+		ipt = os.input("input the no in [0,${rcvals.len}] > ")
+		// vcp.info(ipt, ipt.is_digit())
 		vcp.zeroprt(ipt, "no input any no")
-		if ipt == "" {}
-		ino = ipt.int()
+		if ipt == "" || !ipt.is_digit() {}
+		else {ino = ipt.int()}
+	}else if rcvals.len == 1{
+		vcp.info("only 1 skip interact selection.")
+		time.sleep(time.second)
+		ino = 0
 	}
-	vcp.info("only 1 skip interact selection.")
-	time.sleep(time.second)
+	// vcp.info(ino)
+	if ino < 0 { vcp.info("invalid select no", ino, ipt);  exit(-1) }
 
 		if ino >= 0 && ino < rcvals.len {
 			// parse line
@@ -180,26 +204,26 @@ fn main() {
 			mydir := os.getenv("PWD")
 			vcp.info(mydir, pkgdir)
 
-			// os.write_file(dotsrcinfo, srcinfo) !
-			// os.write_file(".PKGINFO", srcinfo) !
-			// os.write_file("pkgs/.PKGINFO", srcinfo) !
-			// defer {os.rm(".PKGINFO")!}
+			tmptar := "test123.tar"
+			tmpgz := "${tmptar}.gz"
 
-			// runcmd("tar zcf ${mydir}/test123.tar.gz .", pkgdir, false)
-			runcmd("tar cfp ${mydir}/test123.tar .", pkgdir, false)
-			srcinfo := genpkg_dot_srcinfo(pkg, ver, pkgline, os.file_size("test123.tar"))
+			// runcmd("tar zcf ${mydir}/${tmpgz} .", pkgdir, false)
+			runcmd("tar cfp ${mydir}/${tmptar} .", pkgdir, false)
+			srcinfo := genpkg_dot_srcinfo(pkg, ver, pkgline, os.file_size(tmptar))
 			os.write_file("pkgs/.PKGINFO", srcinfo) !
+			// defer {os.rm("pkgs/.PKGINFO")!}
 
 			// repack so it prefixed with usr/local
 			runcmd("mkdir pkgs/usr/local -p", "", false)
-			runcmd("tar xf ${mydir}/test123.tar", os.real_path("pkgs/usr/local"), false)
-			runcmd("rm -f test123.tar", "", false)
+			runcmd("tar xf ${mydir}/${tmptar}", os.real_path("pkgs/usr/local"), false)
+			runcmd("rm -f ${tmptar}", "", false)
 			
 			vcp.info("wkdir", os.getenv("PWD"))
 			runcmd("sudo chmod 755 -R pkgs/usr", "", false)
-			runcmd("fakeroot -- tar zcfp ${mydir}/test123.tar.gz usr/ .PKGINFO", os.real_path( "pkgs/"), false)
-			runcmd("tar tf test123.tar.gz", "", false)
-			runcmd("ls -lh test123.tar.gz", "", false)
+			runcmd("fakeroot -- tar zcfp ${mydir}/${tmpgz} usr/ .PKGINFO", os.real_path( "pkgs/"), false)
+			runcmd("tar tf ${tmpgz}", "", false)
+			runcmd("ls -lh ${tmpgz}", "", false)
+			runcmd("mv ${tmpgz} ${pkg}-${ver}.darwin.amd64.pkg.tar.gz", "", false)
 
 			vcp.info("cleanup pkgs/usr/local/ ...", "", false)
 			runcmd("rm -rf pkgs/usr/local", "", false)
@@ -211,6 +235,7 @@ fn main() {
 	// demo()
 }
 
+// line: /nix/store/imhzscw3r1rd6x40ddc5wwknwdsz6x5r-par2cmdline-0.8.1
 fn parse_nixstore_line(line string) (string, string, string) {
 	hv := line.all_before("-")
 	ver := line.all_after_last("-")	
@@ -255,6 +280,49 @@ makepkgopt = purge
 makepkgopt = !upx"
 
 	return s
+}
+
+fn get_match_store_paths(store_path_file string, kw string) []string{
+	mode := 1 // 1 grep, 2 linebyline, 3 readfull
+	return match mode {
+		1 { get_match_store_paths_grep(store_path_file, kw)}
+		2 { get_match_store_paths_linebyline(store_path_file, kw)}
+		3 { get_match_store_paths_readfull(store_path_file, kw)}
+		else {[]string{}}
+	}
+}
+
+fn get_match_store_paths_linebyline(store_path_file string, kw string) []string{
+	mut rcvals := []string{}
+	// ("store-path-head200")! // about 11M
+	mut fp := os.open(store_path_file) or {panic(err)}
+	defer {fp.close()}
+	
+	mut buf := []u8{len:96}
+	for i:=0; !fp.eof() ;i++ {
+		rn := fp.read_bytes_with_newline(mut &buf) or {
+		vcp.error(err.str()); break}
+		line := buf[..rn].bytestr().trim_space_right()
+		// vcp.info(i, line.len, line, kw)
+		// vcp.info(i, rn, buf.len, line.len, line)
+		if line.len>0 && line.contains(kw) && line != "" {
+			vcp.info("got???", i, line.len, line)
+			rcvals << line
+		}
+	}
+
+	return rcvals
+}
+fn get_match_store_paths_readfull(store_path_file string, kw string) []string{
+	vcp.info("not impl")	
+	return []string{}
+}
+
+fn get_match_store_paths_grep(store_path_file string, kw string) []string{
+	if kw.trim_space().len == 0 { return []string{} }
+	stfile := store_path_file
+	lines := runcmdv("grep ${kw} ${stfile}")
+	return lines
 }
 
 fn demo() {
