@@ -8,17 +8,20 @@ import vcp
 import vcp.curlv
 
 // host/nix-channels/
-const hosturl = "https://mirrors.ustc.edu.cn"
-// const hosturl = "https://mirrors.tuna.tsinghua.edu.cn"
+// const hosturl = "https://mirrors.ustc.edu.cn"
+const hosturl = "https://mirrors.tuna.tsinghua.edu.cn"
 // const chanurl = hosturl+"/nix-channels"
 // const pkgsurl = chanurl+"/nixpkgs-24.05-darwin"
 // const pkgsurl = chanurl+"/nixpkgs-unstable"
 // how get this url by store path???
 // nar pkg url: https://mirrors.ustc.edu.cn/nix-channels/store/nar/1b46dbba8m1dax0baqcnfwqvxah9h93hj638kf1l3jv0i2yqw123.nar.xz
 // https://nix.dev/manual/nix/2.24/store/store-path#:~:text=To%20make%20store%20objects%20accessible%20to%20operating%20system,Base32%20%2820%20arbitrary%20bytes%20become%2032%20ASCII%20characters%29
+// https://mirrors.ustc.edu.cn/nix-channels/store/nix-cache-info
 // nix nar
 // narinfo
 // https://mirrors.ustc.edu.cn/nix-channels/store/w5v7c0ikm6mzf17f3zyjvf0cn8gcammm.narinfo
+// build log, brotli 压缩格式
+// https://cache.nixos.org/log/4dslsa36jhy55szw3xgwzxa6k08bz3z1-pstree-2.39.drv
 
 struct Nixbase {
 	pub mut:
@@ -220,7 +223,7 @@ fn main() {
 			vcp.info("store path full", stpurl)
 
 		mut pker := Repacker.new(nix)
-		pker.dl_store_path() or {
+		pker.dl_store_path2() or {
 			vcp.info(err.str())
 			return
 		}
@@ -269,6 +272,7 @@ fn main() {
 			// some clean share/man/info
 			runcmd("sudo rm -rf pkgs/usr/local/share/man", "", false)
 			runcmd("sudo rm -rf pkgs/usr/local/share/info", "", false)
+			runcmd("sudo rm -f pkgs/usr/local/nix-support/propagated-user-env-packages", "", false)
 
 			runcmd("fakeroot -- tar zcfp ${mydir}/${tmpgz} usr/ .PKGINFO", os.real_path( "pkgs/"), false)
 			// runcmd("tar tf ${tmpgz}", "", false)
@@ -304,12 +308,52 @@ pub fn Repacker.new(nb &Nixbase) &Repacker {
 	return &Repacker{nb:nb2, stpath:nb.stpath}
 }
 
+pub fn (me &Repacker) dl_store_path2() !int {
+	vcp.info(me.stpath)
+	hsval, pkg, ver := parse_nixstore_line(me.stpath)
+	hsval2 := hsval.replace("/nix/store/", "")
+	// vcp.info(hsval, pkg, ver, me.stpath)
+
+	// fetch .narinfo
+	url0 := me.nb.storeurl() + "${hsval2}.narinfo"
+	// vcp.info(url0, me.stpath)
+
+	mut ch := curlv.new()
+	ch.url(url0)
+	mut res := ch.get()!
+	// vcp.info(res.stcode, res.data, me.stpath)
+
+	ni := parse_narinfo(res.data)
+	// vcp.info(ni.str())
+	vcp.info("depends", ni.references)
+
+	url1 := me.nb.storeurl() + "${ni.relative_url}"
+	// vcp.info(url1)
+
+	tmpnar := "pkgs/"+me.stpath.all_after_first("-") +".nar.xz"
+	ch = curlv.new()
+	ch.url(url1)
+	res = ch.get_tofile(tmpnar)!
+	vcp.info(res.stcode, res.data, os.file_size(tmpnar),  me.stpath)
+	defer {os.rm(tmpnar)or{}}
+
+	// runcmd("cat ${tmpnar}|nix-store --restore pkgs/nix/", "", false)
+	cmd := "mkdir -p pkgs/${me.stpath} && rmdir pkgs/${me.stpath} && cat ${tmpnar}|xz -dc|nix-store --restore pkgs/${me.stpath}"
+	os.write_file("pkgs/unnar.sh", cmd)!
+	runcmd("sh pkgs/unnar.sh", "", false)
+	if true {return 0}
+	return error("testing...")
+}
+
+// pub fn pipe_file_toproc()
+
 pub fn (me &Repacker) dl_store_path() !int {
 	pkgline := me.stpath
-	runcmd("nix copy ${pkgline} --to pkgs/ --impure --no-use-registries --no-update-lock-file --no-write-lock-file --no-recursive --refresh --repair -v --debug", "", false)
+	runcmd("nix copy ${pkgline} --to pkgs/ --impure --no-use-registries --no-update-lock-file --no-write-lock-file --no-recursive --refresh --repair -v --debug --keep-derivations", "", false)
 	pkgdir := "pkgs/${pkgline}"
 	dotsrcinfo := pkgdir + "/.PKGINFO"
 	vcp.info("saved", os.exists(pkgdir), pkgdir)
+	// exit(-1)
 	if !os.exists(pkgdir){
 		vcp.info("wtf 404", pkgdir)
 		// exit(-1)
