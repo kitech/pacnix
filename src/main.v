@@ -29,6 +29,11 @@ struct Nixbase {
 
 	stpath string
 }
+pub fn Nixbase.new(hosturl string) Nixbase {
+	me := Nixbase{hosturl:hosturl}
+	// home := 
+	return me
+}
 pub fn (me Nixbase) chanurl() string { return me.hosturl + "/nix-channels/"}
 // pub fn (me Nixbase) pkgurl() string { return me.chanurl() + "nixpkgs-24.05-darwin/" }
 pub fn (me Nixbase) pkgurl() string { return me.chanurl() + "nixpkgs-unstable/" }
@@ -55,7 +60,7 @@ pub fn (mut me Nixbase) set_stpath(stpath string) { me.stpath = stpath }
 // copy下来的文件不能修改的问题，需要root？
 
 pub fn (mut me Nixbase) sync_meta() {
-	
+
 }
 
 pub fn (mut me Nixbase) fetch_narinfo(stpath string) Narinfo {
@@ -108,77 +113,12 @@ pub struct Narinfo {
 
 /////
 pub fn runcmdv(cmd string, wkdir ... string) []string {
-	dir := firstofv(wkdir)
-	scc := runcmd(cmd, dir, true)
-	return scc.split_into_lines()
+	return vcp.runcmdv(cmd, ...wkdir)
 }
 
 // todo pipe out or hang somewhere when too many out
 pub fn runcmd(cmd string, wkdir string, capio bool) string {
-	if !cmd.contains("/which ") && cmd != "which" {
-		// vcp.info("[${cmd}]", "wkdir:", wkdir)
-	}
-	args := cmdline_split(cmd)
-	// vcp.info(args.str())
-	cmdfile := cmdfile_reform(args[0])
-	// vcp.info(cmdfile, cmd)
-	
-	mut proc := os.Process{}
-	proc.filename = cmdfile
-	proc.set_args(args[1..])
-	if capio { proc.set_redirect_stdio() }
-	if wkdir.len > 0 { proc.set_work_folder(wkdir) }
-	proc.run()
-	mut outbuf := ""
-	mut errbuf := ""
-	if capio {
-		mut toobig := false
-		for proc.is_alive() {
-			outstr := proc.pipe_read(.stdout) or {
-				// vcp.error(err.str())
-				""}
-			if !toobig { outbuf += outstr }
-			// vcp.info("out", outstr.len, outbuf.len)
-			errstr := proc.pipe_read(.stderr) or {
-				// vcp.error(err.str())
-				"" }
-			if !toobig { errbuf += errstr }
-			// vcp.info("`${cmd}`", outstr.len, errstr.len, "buffed", outbuf.len, errbuf.len)
-			if outbuf.len + errbuf.len > 8*1024*1025 {
-				toobig = true
-				vcp.warn("out toobig", outbuf.len + errbuf.len, cmd)
-			}
-		}
-	}
-	// vcp.info("should done", proc.is_alive(), outbuf.len, errbuf.len, cmd)
-	proc.wait()
-	defer {proc.close()}
-
-	// vcp.info(proc.code, proc.err, args)
-	if capio {
-		outbuf += proc.stdout_read()
-		errbuf += proc.stderr_read()
-		// vcp.info("`${cmd}`\n", outstr, errstr)
-		// vcp.info(proc.stdout_slurp())
-		return outbuf+errbuf
-	}
-	return ""
-}
-
-pub fn cmdline_split(cmd string) []string{
-	return cmd.split(" ")
-}
-pub fn cmdfile_reform(file string) string {
-	// todo check abspath
-	if os.base(file) == file {
-		// line := os.system("which $file") // no capture
-		line := runcmd("/usr/bin/which $file", "", true)
-		if file != "which" && file != "tar" {
-		// vcp.info(file, "=>", line.trim_space())
-		}
-		return line.trim_space()
-	}
-	return file
+	return vcp.runcmd(cmd, wkdir, capio)
 }
 
 @[xdoc: 'My application that does X']
