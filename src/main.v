@@ -171,7 +171,6 @@ fn main() {
 	// store_path_file := "store-path-head200" // about 15K
 	// store_path_file := "store-path" // about 11M, stable 24.05
 	store_path_file := "store-paths" // about 24M, unstable
-	mut nix := Nixbase{hosturl:hosturl}
 	
 	vcp.info("reading store-path maybe need secs...")
 	rcvals := get_match_store_paths(store_path_file, pkgname)
@@ -214,18 +213,36 @@ fn main() {
 			hv, pkg, ver := parse_nixstore_line(pkgline)
 			vcp.info(hv, pkg, ver)
 
+		mut nix := Nixbase{hosturl:hosturl}
+		nix.stpath = pkgline
 
 			stpurl := nix.storeurl() + pkgline
 			vcp.info("store path full", stpurl)
 
-			runcmd("nix copy ${pkgline} --to pkgs/ --impure --no-use-registries --no-update-lock-file --no-write-lock-file --no-recursive --refresh --repair -v --debug", "", false)
+		mut pker := Repacker.new(nix)
+		pker.dl_store_path() or {
+			vcp.info(err.str())
+			return
+		}
+		arch := pker.detect_binarch() or {
+			vcp.error(err.str(), pkgline)
+			pker.cleanup()
+			exit(-1)
+		}
+		match arch {
+			'arm64' { vcp.warn("ok but ignore now:", arch)
+			pker.cleanup(); exit(-1)}
+			else{}
+		}
+
+			// runcmd("nix copy ${pkgline} --to pkgs/ --impure --no-use-registries --no-update-lock-file --no-write-lock-file --no-recursive --refresh --repair -v --debug", "", false)
 			pkgdir := "pkgs/${pkgline}"
-			dotsrcinfo := pkgdir + "/.PKGINFO"
-			vcp.info("saved", os.exists(pkgdir), pkgdir)
-			if !os.exists(pkgdir){
-				vcp.info("wtf 404", pkgdir)
-				exit(-1)
-			}
+			// dotsrcinfo := pkgdir + "/.PKGINFO"
+			// vcp.info("saved", os.exists(pkgdir), pkgdir)
+			// if !os.exists(pkgdir){
+			// 	vcp.info("wtf 404", pkgdir)
+			// 	exit(-1)
+			// }
 
 			mydir := os.getenv("PWD")
 			vcp.info(mydir, pkgdir)
@@ -254,16 +271,18 @@ fn main() {
 			runcmd("sudo rm -rf pkgs/usr/local/share/info", "", false)
 
 			runcmd("fakeroot -- tar zcfp ${mydir}/${tmpgz} usr/ .PKGINFO", os.real_path( "pkgs/"), false)
-			runcmd("tar tf ${tmpgz}", "", false)
+			// runcmd("tar tf ${tmpgz}", "", false)
+			runcmd("gzip -tv ${tmpgz}", "", false)
 			runcmd("ls -lh ${tmpgz}", "", false)
 			runcmd("mv ${tmpgz} ${pkg}-${ver}.darwin.amd64.pkg.tar.gz", "", false)
 
-			vcp.info("cleanup pkgs/usr/local/ ...", "", false)
-			// runcmd("rm -rf pkgs/usr/local", "", false)
-			runcmd("sudo rm -rf pkgs/usr/local", "", false)
-			// runcmd("rm -rf pkgs/nix/store/", "", false)
-			runcmd("sudo rm -rf pkgs/nix/store/", "", false)
-			runcmd("sudo rm -rf pkgs/nix/var/", "", false)
+		pker.cleanup()
+			// vcp.info("cleanup pkgs/usr/local/ ...", "", false)
+			// // runcmd("rm -rf pkgs/usr/local", "", false)
+			// runcmd("sudo rm -rf pkgs/usr/local", "", false)
+			// // runcmd("rm -rf pkgs/nix/store/", "", false)
+			// runcmd("sudo rm -rf pkgs/nix/store/", "", false)
+			// runcmd("sudo rm -rf pkgs/nix/var/", "", false)
 		}
 	// demo()
 }
@@ -272,23 +291,85 @@ pub struct Repacker {
 	pub mut:
 	nb &Nixbase = vnil
 	recursive bool
-	store_path string // original
+	stpath string // original
 	narval Narinfo
 
 	depends []&Repacker
-	deriver &Repacker // must & or invalid recursive struct error
+	deriver &Repacker = vnil // must & or invalid recursive struct error
 }
 
-pub fn (mut me Repacker) detect_binarch() {
-
+pub fn Repacker.new(nb &Nixbase) &Repacker {
+	nb2 := refvar2mut(nb)
+	assert nb.stpath != ""
+	return &Repacker{nb:nb2, stpath:nb.stpath}
 }
 
-pub fn (mut me Repacker) dl_store_path() {
+pub fn (me &Repacker) dl_store_path() !int {
+	pkgline := me.stpath
+	runcmd("nix copy ${pkgline} --to pkgs/ --impure --no-use-registries --no-update-lock-file --no-write-lock-file --no-recursive --refresh --repair -v --debug", "", false)
+	pkgdir := "pkgs/${pkgline}"
+	dotsrcinfo := pkgdir + "/.PKGINFO"
+	vcp.info("saved", os.exists(pkgdir), pkgdir)
+	if !os.exists(pkgdir){
+		vcp.info("wtf 404", pkgdir)
+		// exit(-1)
+		return error_with_code("dl stpath error", -1)
+	}
+	return 0
+}
 
+pub type MapSI = map[string]int
+pub type MapSS = map[string]string
+
+pub fn (me &Repacker) detect_binarch() !string {
+	stpath := me.stpath
+	pkgdir := "pkgs/${stpath}"
+
+	mut archs := map[string]int{}
+	dir_walk_withctx(pkgdir, mut archs, fn(mut ctx map[string]int, f string){
+		// vcp.info(f, os.is_executable(f))
+		// if !os.is_executable(f) { return }
+		lines := runcmdv("file ${f}")
+		// vcp.info(f, lines.str())
+		if lines.len>0 && lines[0].contains("Mach-O") && lines[0].contains("executable") {
+			arch := lines[0].all_after_last(" ")
+			ctx[arch] = 1+ ctx[arch]or{0}
+		}
+	})
+	vcp.info(archs.len, archs.str(), pkgdir)
+
+	mut arch := "any"
+	if archs.len == 0 {
+		// look good
+	}else if archs["x86_64"]>0 && archs["arm64"]>0 {
+		vcp.warn("complex", archs.str(), stpath)
+		return error("cannot resolve pkgarch, ${archs.keys()}")
+	} else if archs["x86_64"]>0 {
+		// ok
+		arch = archs.keys().first()
+	} else {
+		// vcp.error("not support", archs.str(), pkgline)
+		arch = archs.keys().first()
+	}
+
+	return arch
 }
 
 pub fn (mut me Repacker) packit() {
 
+}
+
+pub fn (mut me Repacker) clean_unused() {
+
+}
+
+pub fn (mut me Repacker) cleanup() {
+	vcp.info("cleanup pkgs/usr/local/ ...", "", false)
+	// runcmd("rm -rf pkgs/usr/local", "", false)
+	runcmd("sudo rm -rf pkgs/usr/local", "", false)
+	// runcmd("rm -rf pkgs/nix/store/", "", false)
+	runcmd("sudo rm -rf pkgs/nix/store/", "", false)
+	runcmd("sudo rm -rf pkgs/nix/var/", "", false)
 }
 
 fn get_cmds_full_paths(cmds ... string) map[string]string{
@@ -303,7 +384,10 @@ fn store_path_to_narpath(stpath string) string {
 }
 
 fn cleanup_temps() {
+}
 
+pub fn dir_walk_withctx<T>(dir string, mut ctx T, fun fn (mut ctx T, f string)) {
+	os.walk_with_context(dir, ctx, fun)
 }
 
 fn addassignop<T>(v T, p voidptr) T {
