@@ -3,13 +3,16 @@ module main
 import os
 import flag
 import time
+import rand
 
 import vcp
 import vcp.curlv
 
 // host/nix-channels/
-// const hosturl = "https://mirrors.ustc.edu.cn"
-const hosturl = "https://mirrors.tuna.tsinghua.edu.cn"
+const nixst_ustc = "https://mirrors.ustc.edu.cn"
+const nixst_tuna = "https://mirrors.tuna.tsinghua.edu.cn"
+const nixst_sjtu = "https://mirrors.sjtug.sjtu.edu.cn"
+// const hosturl = "https://cache.nixos.org"
 // const chanurl = hosturl+"/nix-channels"
 // const pkgsurl = chanurl+"/nixpkgs-24.05-darwin"
 // const pkgsurl = chanurl+"/nixpkgs-unstable"
@@ -32,9 +35,13 @@ struct Nixbase {
 
 	stpath string
 }
-pub fn Nixbase.new(hosturl string) Nixbase {
-	me := Nixbase{hosturl:hosturl}
+pub fn Nixbase.new(hosturl ...string) Nixbase {
+	mut me := Nixbase{hosturl: firstofv(hosturl)}
 	// home := 
+    hosturls := [nixst_sjtu, nixst_tuna, nixst_ustc]
+    if hosturl.len==0 {
+        me.hosturl = hosturls[rand.int()%hosturls.len]
+    }
 	return me
 }
 pub fn (me Nixbase) chanurl() string { return me.hosturl + "/nix-channels/"}
@@ -67,7 +74,7 @@ pub fn (mut me Nixbase) sync_meta() {
 }
 
 pub fn (mut me Nixbase) fetch_narinfo(stpath string) Narinfo {
-	mut ch := curlv.new()
+	mut ch := curlv.new().useragent("nix/2.21")
 	ch.url(me.store_path_tonarurl(stpath))
 	res := ch.get() or { panic(err) }
 	vcp.info(res.stcode, res.data.len, stpath)
@@ -150,6 +157,7 @@ struct Cmdarg {
 // todo rootless mode, specifiy package install base
 // todo specifiy nix channel version
 // todo avoid nix copy depeneds
+// todo package merge, bin/lib/man/info...
 // todo order candidate store path, prefix, suffix...
 // prerequires: sudo!!! tar brotli grep install_name_tool
 // sometimes need select package.
@@ -216,7 +224,8 @@ fn main() {
 			hv, pkg, ver := parse_nixstore_line(pkgline)
 			vcp.info(hv, pkg, ver)
 
-		mut nix := Nixbase{hosturl:hosturl}
+		// mut nix := Nixbase.new() // (hosturl)
+        mut nix := Nixbase.new(nixst_tuna)
 		nix.stpath = pkgline
 
 			stpurl := nix.storeurl() + pkgline
@@ -273,7 +282,11 @@ fn main() {
 			runcmd("sudo rm -rf pkgs/usr/local/share/man", "", false)
 			runcmd("sudo rm -rf pkgs/usr/local/share/info", "", false)
 			runcmd("sudo rm -f pkgs/usr/local/nix-support/propagated-user-env-packages", "", false)
+			runcmd("sudo rm -f pkgs/usr/local/nix-support/setup-hook", "", false)
 
+        if pker.narval.nar_size > 8*1000*1000 {
+            vcp.info("compressing to", tmpgz, "about", pker.narval.nar_size)
+        }
 			runcmd("fakeroot -- tar zcfp ${mydir}/${tmpgz} usr/ .PKGINFO", os.real_path( "pkgs/"), false)
 			// runcmd("tar tf ${tmpgz}", "", false)
 			runcmd("gzip -tv ${tmpgz}", "", false)
@@ -308,7 +321,7 @@ pub fn Repacker.new(nb &Nixbase) &Repacker {
 	return &Repacker{nb:nb2, stpath:nb.stpath}
 }
 
-pub fn (me &Repacker) dl_store_path2() !int {
+pub fn (mut me Repacker) dl_store_path2() !int {
 	vcp.info(me.stpath)
 	hsval, pkg, ver := parse_nixstore_line(me.stpath)
 	hsval2 := hsval.replace("/nix/store/", "")
@@ -319,20 +332,22 @@ pub fn (me &Repacker) dl_store_path2() !int {
 	// vcp.info(url0, me.stpath)
 
 	mut ch := curlv.new()
-	ch.url(url0)
+	ch.url(url0).useragent("nix/2.21")
 	mut res := ch.get()!
 	// vcp.info(res.stcode, res.data, me.stpath)
+	if res.stcode > 303 { return error("http resp ${res.stcode}")}
 
 	ni := parse_narinfo(res.data)
 	// vcp.info(ni.str())
 	vcp.info("depends", ni.references)
+    me.narval = ni
 
 	url1 := me.nb.storeurl() + "${ni.relative_url}"
 	// vcp.info(url1)
 
 	tmpnar := "pkgs/"+me.stpath.all_after_first("-") +".nar.xz"
 	ch = curlv.new()
-	ch.url(url1)
+	ch.url(url1).useragent("nix/2.21")
 	res = ch.get_tofile(tmpnar)!
 	vcp.info(res.stcode, res.data, os.file_size(tmpnar),  me.stpath)
 	defer {os.rm(tmpnar)or{}}
@@ -365,6 +380,13 @@ pub fn (me &Repacker) dl_store_path() !int {
 pub type MapSI = map[string]int
 pub type MapSS = map[string]string
 
+// mainly for check binary executable
+fn is_uncare_file(f string) bool {
+    return os.is_dir(f) || os.is_link(f) || !os.is_executable(f)
+}
+
+// todo aarch64 cannot
+// todo support return os
 pub fn (me &Repacker) detect_binarch() !string {
 	stpath := me.stpath
 	pkgdir := "pkgs/${stpath}"
@@ -372,7 +394,8 @@ pub fn (me &Repacker) detect_binarch() !string {
 	mut archs := map[string]int{}
 	dir_walk_withctx(pkgdir, mut archs, fn(mut ctx map[string]int, f string){
 		// vcp.info(f, os.is_executable(f))
-		// if !os.is_executable(f) { return }
+        if os.is_dir(f) || os.is_link(f) { return }
+		if !os.is_executable(f) { return }
 		lines := runcmdv("file ${f}")
 		// vcp.info(f, lines.str())
 		if lines.len>0 && lines[0].contains("Mach-O") && lines[0].contains("executable") {
@@ -440,23 +463,46 @@ fn addassignop<T>(v T, p voidptr) T {
 	unsafe { *(&T(p)) = n }
 	return n
 }
+// todo two slow when many bin/lib, such as emacs's 3000 .eln files
+// todo generate bash script, and batch run
+// bug? maybe this cause memory usage up to 7100M?
 fn replace_sharelib_ldpaths(dir string) {
-	mut spctx := 0
-	os.walk_with_context(dir, voidptr(&spctx), fn (ctx voidptr, f string) {
+    struct Spctx {
+        pub mut:
+        arch_nerr int
+        file_cnt int
+        btime time.Time
+        skip bool
+    }
+    mut spctx := Spctx{}
+    spctx.btime = time.now()
+	// mut spctx := 0
+	// os.walk_with_context(dir, voidptr(&spctx), fn (ctx voidptr, f string) {
+    dir_walk_withctx(dir, mut spctx, fn(mut ctx Spctx, f string) {
+        ctx.file_cnt+=1
+        if ctx.skip { return }
+        if time.since(ctx.btime)>3*time.minute || ctx.file_cnt > 300 {
+            if !vcp.term_askyn("used ${time.since(ctx.btime)}, files ${ctx.file_cnt}, continue?") {
+                ctx.skip = true
+                return
+            }
+        }
 		// vcp.info(f, os.is_dir(f), os.is_link(f))
 		if os.is_link(f) {
-			vcp.info(f, "=>", os.real_path(f))
+			// vcp.info(f, "=>", os.real_path(f))
 		}
 		if os.is_dir(f) || os.is_link(f) { return }
-		if !check_binarch(f) { addassignop(1, ctx)
-			vcp.info(check_binarch(f), ctx, f)
+        if !os.is_executable(f) { return }
+		if !check_binarch(f) { // addassignop(1, ctx)
+            ctx.arch_nerr+=1
+			vcp.info(check_binarch(f), ctx.str(), f)
 		}
-		replace_sharelib_ldpath(f)
+		replace_sharelib_ldpath(f, ctx.file_cnt)
 	})
 	// vcp.info("binarcherr", spctx, dir)
-	vcp.falseprt(spctx==0, "binarch not match", spctx, dir)
+	vcp.falseprt(spctx.arch_nerr==0, "binarch not match", spctx.str(), time.since(spctx.btime).str(), dir)
 }
-fn replace_sharelib_ldpath(file string) {
+fn replace_sharelib_ldpath(file string, idx int) {
 	lines := runcmdv("otool -L ${file}")
 	// vcp.info(lines)
 	if lines.len < 1 { return }
@@ -583,10 +629,10 @@ fn get_match_store_paths_grep(store_path_file string, kw string) []string{
 }
 
 fn demo() {
-	nix := Nixbase{hosturl:hosturl}
+	nix := Nixbase{}
 
 	mut ch := curlv.new()
-	ch.url(nix.pkgurl())
+	ch.url(nix.pkgurl()).useragent("nix/2.21")
 	mut res := ch.get() or { panic(err) }
 	vcp.info(res.stcode, res.data.len, ch.redirurl())
 
