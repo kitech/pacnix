@@ -10,8 +10,10 @@ import vcp.curlv
 
 // host/nix-channels/
 const nixst_ustc = "https://mirrors.ustc.edu.cn" // many 404
-const nixst_tuna = "https://mirrors.tuna.tsinghua.edu.cn" // may 403
-const nixst_sjtu = "https://mirrors.sjtug.sjtu.edu.cn"
+const nixst_tuna = "https://mirrors.tuna.tsinghua.edu.cn" // many 403
+const nixst_sjtu = "https://mirrors.sjtug.sjtu.edu.cn" // many noresp
+const nixst_nju = "https://mirror.nju.edu.cn"
+const nixst_sustech = "https://mirrors.sustech.edu.cn"
 // const hosturl = "https://cache.nixos.org"
 // const chanurl = hosturl+"/nix-channels"
 // const pkgsurl = chanurl+"/nixpkgs-24.05-darwin"
@@ -45,7 +47,7 @@ struct Nixbase {
 pub fn Nixbase.new(hosturl ...string) Nixbase {
 	mut me := Nixbase{hosturl: firstofv(hosturl)}
 	// home := 
-    hosturls := [nixst_sjtu, nixst_tuna, nixst_ustc]
+    hosturls := [nixst_sjtu, nixst_tuna, nixst_ustc, nixst_nju, nixst_sustech]
     if hosturl.len==0 {
         me.hosturl = hosturls[rand.int()%hosturls.len]
     }
@@ -150,6 +152,7 @@ pub fn runcmd(cmd string, wkdir string, capio bool) (string, bool) {
 @[version: '1.2.3']
 @[name: 'app']
 struct Cmdarg {
+    pub mut:
     show_version bool @[short: v; xdoc: 'Show version and exit']
     debug_level  int  @[long: debug; short: d; xdoc: 'Debug level']
     level        f32  @[only: l; xdoc: 'This doc text is overwritten']
@@ -159,6 +162,12 @@ struct Cmdarg {
     multi        int    @[only: m; repeats]
     wroom        []int  @[short: w]
     ignore_me    string @[ignore]
+
+    // used
+    stpath       bool   @[xdoc: "specify exact store path/package"]
+    stname   string @[xdoc: "store host's name. nixos/ustc/tuna/nju..."]
+    store    string @[xdoc: "store full url"]
+    excepts      []string @[xdoc: "filter except words, like grep -v"]
 }
 
 // todo temp repack directory
@@ -193,12 +202,19 @@ fn main() {
 
 	args := nomats
 	pkgname := args[0]
+    mut rcvals := []string{}
+    mut ino := -1
+
+    if cfg.stpath {
+        rcvals << pkgname
+        ino = 0
+    }else{
 	// store_path_file := "store-path-head200" // about 15K
 	// store_path_file := "store-path" // about 11M, stable 24.05
 	store_path_file := "store-paths" // about 24M, unstable
-	
+
 	vcp.info("reading store-path maybe need secs...")
-	rcvals := get_match_store_paths(store_path_file, pkgname)
+	rcvals = get_match_store_paths(store_path_file, pkgname)
 	vcp.info(rcvals.len, rcvals.str().elide_right(64))
 	vcp.zeroprt(rcvals.len, "not found", pkgname, os.file_size(store_path_file))
 	if rcvals.len == 0 {
@@ -216,7 +232,7 @@ fn main() {
 	if rcvals.len > maxoptno {
 		exit(-1)
 	}
-	mut ino := -1
+
 	mut ipt := ""
 	if rcvals.len > 1 {
 		ipt = os.input("input the no in [0,${rcvals.len-1}] > ")
@@ -231,6 +247,7 @@ fn main() {
 	}
 	// vcp.info(ino)
 	if ino < 0 { vcp.info("invalid select no", ino, ipt);  exit(-1) }
+    }
 
 	if ino >= 0 && ino < rcvals.len {
 			// parse line
@@ -240,8 +257,10 @@ fn main() {
 
 		// mut nix := Nixbase.new() // (hosturl)
         // mut nix := Nixbase.new(nixst_tuna)
-        mut nix := Nixbase.new(nixst_sjtu)
+        // mut nix := Nixbase.new(nixst_sjtu)
         // mut nix := Nixbase.new(nixst_ustc)
+        // mut nix := Nixbase.new(nixst_nju)
+        mut nix := Nixbase.new(nixst_sustech)
 		nix.stpath = pkgline
 
 			stpurl := nix.storeurl() + pkgline
@@ -265,15 +284,7 @@ fn main() {
 			else{}
 		}
 
-			// runcmd("nix copy ${pkgline} --to pkgs/ --impure --no-use-registries --no-update-lock-file --no-write-lock-file --no-recursive --refresh --repair -v --debug", "", false)
 			pkgdir := "pkgs/${pkgline}"
-			// dotsrcinfo := pkgdir + "/.PKGINFO"
-			// vcp.info("saved", os.exists(pkgdir), pkgdir)
-			// if !os.exists(pkgdir){
-			// 	vcp.info("wtf 404", pkgdir)
-			// 	exit(-1)
-			// }
-
 			mydir := os.getenv("PWD")
 			vcp.info(mydir, pkgdir)
 
@@ -313,12 +324,6 @@ fn main() {
 			runcmd("mv ${tmpgz} ${pkg}-${ver}.darwin.amd64.pkg.tar.gz", "", false)
 
 		pker.cleanup()
-			// vcp.info("cleanup pkgs/usr/local/ ...", "", false)
-			// // runcmd("rm -rf pkgs/usr/local", "", false)
-			// runcmd("sudo rm -rf pkgs/usr/local", "", false)
-			// // runcmd("rm -rf pkgs/nix/store/", "", false)
-			// runcmd("sudo rm -rf pkgs/nix/store/", "", false)
-			// runcmd("sudo rm -rf pkgs/nix/var/", "", false)
 		}
 	// demo()
 }
@@ -340,6 +345,7 @@ pub fn Repacker.new(nb &Nixbase) &Repacker {
 	return &Repacker{nb:nb2, stpath:nb.stpath}
 }
 
+// todo continue interrupted download
 pub fn (mut me Repacker) dl_store_path2() !int {
 	vcp.info(me.stpath)
 	hsval, pkg, ver := parse_nixstore_line(me.stpath)
@@ -382,6 +388,7 @@ pub fn (mut me Repacker) dl_store_path2() !int {
 
         tmpnar := "pkgs/"+me.stpath.all_after_first("-") +".nar.xz"
         mut ch := curlv.new()
+        ch.http1()
         ch.url(url1).useragent("nix/2.21")
         res := ch.get_tofile(tmpnar)!
         vcp.info(res.stcode, res.data, os.file_size(tmpnar),  me.stpath)
@@ -709,7 +716,7 @@ fn get_match_store_paths_readfull(store_path_file string, kw string) []string{
 fn get_match_store_paths_grep(store_path_file string, kw string) []string{
 	if kw.trim_space().len == 0 { return []string{} }
 	stfile := store_path_file
-	lines, ok := runcmdv("grep ${kw} ${stfile}")
+	lines, ok := vcp.runcmdv("grep -i ${kw} ${stfile}")
 	return lines
 }
 
