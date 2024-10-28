@@ -1,6 +1,7 @@
 module main
 
 import os
+import log
 import flag
 import time
 import rand
@@ -267,22 +268,23 @@ fn main() {
 			vcp.info("store path full", stpurl)
 
 		mut pker := Repacker.new(nix)
+        defer { pker.cleanup() }
         vcp.info("downloading...", pkgline)
 		pker.dl_store_path2() or {
 			vcp.info(err.str())
 			return
 		}
-        vcp.info("detect_binarch...", pkgline)
-		arch := pker.detect_binarch() or {
-			vcp.error(err.str(), pkgline)
-			pker.cleanup()
-			exit(-1)
-		}
-		match arch {
-			'arm64' { vcp.warn("ok but ignore now:", arch)
-			pker.cleanup(); exit(-1)}
-			else{}
-		}
+        // vcp.info("detect_binarch...", pkgline)
+		// arch := pker.detect_binarch() or {
+		// 	vcp.error(err.str(), pkgline)
+		// 	pker.cleanup()
+		// 	exit(-1)
+		// }
+		// match arch {
+		// 	'arm64' { vcp.warn("ok but ignore now:", arch)
+		// 	pker.cleanup(); exit(-1)}
+		// 	else{}
+		// }
 
 			pkgdir := "pkgs/${pkgline}"
 			mydir := os.getenv("PWD")
@@ -292,10 +294,12 @@ fn main() {
 			tmpgz := "${tmptar}.gz"
 
             assert pkgdir!=""
+
 			// runcmd("tar zcf ${mydir}/${tmpgz} .", pkgdir, false)
 			runcmd("tar cfp ${mydir}/${tmptar} .", pkgdir, false)
 			srcinfo := genpkg_dot_srcinfo(pkg, ver, pkgline, os.file_size(tmptar))
 			os.write_file("pkgs/.PKGINFO", srcinfo) !
+            os.cp(pker.narinfo_file, "pkgs/${os.base(pkgline)}.narinfo") or { vcp.info(err.str()); return }
 			// defer {os.rm("pkgs/.PKGINFO")!}
 
 			// repack so it prefixed with usr/local
@@ -306,8 +310,19 @@ fn main() {
 			vcp.info("wkdir", os.getenv("PWD"))
 			runcmd("sudo chmod 755 -R pkgs/usr", "", false)
 
+        // uniform processes
+        pctx := pker.process_files("pkgs/usr/local")
+        if true {
+            // pker.cleanup()
+            // return
+        }
+        if pctx.skip {
+            vcp.warn("skiped", pctx.reason)
+
+            return
+        }
 			// resolve dlpath
-			replace_sharelib_ldpaths("pkgs/usr/local")
+			// replace_sharelib_ldpaths("pkgs/usr/local")
 			// some clean share/man/info
 			runcmd("sudo rm -rf pkgs/usr/local/share/man", "", false)
 			runcmd("sudo rm -rf pkgs/usr/local/share/info", "", false)
@@ -317,13 +332,15 @@ fn main() {
         if pker.narval.nar_size > 8*1000*1000 {
             vcp.info("compressing to", tmpgz, "about", pker.narval.nar_size)
         }
-			runcmd("fakeroot -- tar zcfp ${mydir}/${tmpgz} usr/ .PKGINFO", os.real_path( "pkgs/"), false)
+			runcmd("fakeroot -- tar zcfp ${mydir}/${tmpgz} usr/ .PKGINFO ${os.base(pkgline)}.narinfo", os.real_path( "pkgs/"), false)
 			// runcmd("tar tf ${tmpgz}", "", false)
 			runcmd("gzip -tv ${tmpgz}", "", false)
 			runcmd("ls -lh ${tmpgz}", "", false)
 			runcmd("mv ${tmpgz} ${pkg}-${ver}.darwin.amd64.pkg.tar.gz", "", false)
+        // last check
+        // runcmd("tar -zx -O -f ${pkg}-${ver}.darwin.amd64.pkg.tar.gz  .PKGINFO")
 
-		pker.cleanup()
+		// pker.cleanup()
 		}
 	// demo()
 }
@@ -335,8 +352,18 @@ pub struct Repacker {
 	stpath string // original
 	narval Narinfo
 
+    narinfo_file string
+    narpkg_file string
+
 	depends []&Repacker
 	deriver &Repacker = vnil // must & or invalid recursive struct error
+}
+
+pub interface FileModer {
+    // 返回值：
+    // true, false 表示是否skip, early return
+    // err, 表示有处理错误
+    trymod(fm FileMeta) !bool
 }
 
 pub fn Repacker.new(nb &Nixbase) &Repacker {
@@ -353,6 +380,8 @@ pub fn (mut me Repacker) dl_store_path2() !int {
 	// vcp.info(hsval, pkg, ver, me.stpath)
     narinfo_file := "${me.nb.srcdir}/${hsval2}.narinfo"
     narpkg_file := "${me.nb.srcdir}/${os.base(me.stpath)}.nar.xz"
+    me.narinfo_file = narinfo_file
+    me.narpkg_file = narpkg_file
 
 	// fetch .narinfo
     if !os.exists(narinfo_file) {
@@ -430,12 +459,93 @@ pub fn (me &Repacker) dl_store_path() !int {
 	return 0
 }
 
+// 查看包是否可用，1, 仅包含exescript, 2 不包含macx64之外的
+pub fn (me &Repacker) process_files(dir string) &DirwalkContext {
+    mut spctx := &DirwalkContext{}
+    spctx.btime = time.now()
+	// mut spctx := 0
+	// os.walk_with_context(dir, voidptr(&spctx), fn (ctx voidptr, f string) {
+    // it's hack version, see vcp
+    vcp.walk_with_exit(dir, voidptr(spctx), fn(mut ctx DirwalkContext, f string) bool {
+		if os.is_dir(f) || os.is_link(f) { return true}
+        ctx.file_cnt+=1
+        fm := get_file_meta(f)
+
+        len0 := ctx.fmetas.len
+        len1 := ctx.file_cnt
+        ctx.prbar.step(len0, len1, "inwalk: ${len0}/${len1} ${os.base(f)} ${fm.str0()}")
+
+        if fm.islnx { ctx.skip = true;
+            ctx.reason = "islnx"
+            return false }
+        if fm.ismac && fm.isarm() { ctx.skip = true;
+            ctx.reason = "mac.arm"
+            return false }
+
+        ctx.fmetas << fm
+        if fm.isbinexe() {
+            replace_sharelib_ldpath(f, len0, len1)
+        }else if fm.isexescript {
+            replace_exe_script_ldpath(f, len0, len1)
+        } else {
+            // return true
+        }
+        
+		// // vcp.info(f, os.is_dir(f), os.is_link(f))
+		// if os.is_dir(f) || os.is_link(f) { return }
+        // if !os.is_executable(f) { return }
+		// if !check_binarch(f) { // addassignop(1, ctx)
+        //     ctx.arch_nerr+=1
+		// 	vcp.info(check_binarch(f), ctx.str(), f)
+		// }
+        // ctx.binfiles << f
+        // len0 := ctx.binfiles.len
+        // len1 := ctx.file_cnt
+        // ctx.prbar.step(len0, len1, "inwalk: ${len0}/${len1} ${os.base(f)}")
+        // // vcp.info(len0, len1, "inwalk: ${len0}/${len1} ${os.base(f)}")
+		// // replace_sharelib_ldpath(f, ctx.file_cnt)
+        return true
+	})
+    spctx.prbar.end()
+	vcp.info("binarcherr", spctx.str().elide_right(88), time.since(spctx.btime).str(), spctx.skip, spctx.reason, dir)
+
+    return spctx
+}
+
 pub type MapSI = map[string]int
 pub type MapSS = map[string]string
 
+const langsrcexts = [".v", ".h", ".sh"]
 // mainly for check binary executable
 fn is_uncare_file(f string) bool {
     return os.is_dir(f) || os.is_link(f) || !os.is_executable(f)
+}
+// python, bash,
+// s: file path/to/file 的输出
+fn is_exe_script(s string) bool {
+    // Python      script text executable, ASCII text
+    // POSIX shell script text executable, ASCII text
+    // l := s.to_lower()
+    return s.contains('script text executable, ASCII text')
+}
+// ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked
+// ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV), dynamically linked
+fn is_linux_elf(s string) bool {
+    l := s.to_lower()
+    return l.starts_with("elf") && l.contains("lsb")
+}
+// Mach-O 64-bit executable x86_64
+// Mach-O 64-bit dynamically linked shared library x86_64
+fn is_mac_obj(s string) bool {
+    return s.contains("Mach-O") &&
+        (s.contains("executable") || s.contains("shared library"))
+}
+
+fn get_file_cpuarch(s string) string {
+    if is_mac_obj(s) { return s.all_after_last(" ")} 
+    if is_linux_elf(s) { return s.split(", ")[1].all_after(" ")}
+    if is_exe_script(s) { return "any"}
+    return "cpu??"
 }
 
 // todo aarch64 cannot
@@ -445,6 +555,7 @@ pub fn (me &Repacker) detect_binarch() !string {
 	pkgdir := "pkgs/${stpath}"
 
 	mut archs := map[string]int{}
+    mut osnames := map[string]int{}
 	dir_walk_withctx(pkgdir, mut archs, fn(mut ctx map[string]int, f string){
 		// vcp.info(f, os.is_executable(f))
         if os.is_dir(f) || os.is_link(f) { return }
@@ -484,7 +595,7 @@ pub fn (mut me Repacker) clean_unused() {
 }
 
 pub fn (mut me Repacker) cleanup() {
-	vcp.info("cleanup pkgs/usr/local/ ...", "", false)
+	vcp.info("pkgs/{usr,nix}", os.base(me.stpath))
 	// runcmd("rm -rf pkgs/usr/local", "", false)
 	runcmd("sudo rm -rf pkgs/usr/local", "", false)
 	// runcmd("rm -rf pkgs/nix/store/", "", false)
@@ -516,11 +627,16 @@ fn addassignop<T>(v T, p voidptr) T {
 	unsafe { *(&T(p)) = n }
 	return n
 }
-fn replace_sharelib_ldpaths(dir string) {
-    // replace_sharelib_ldpaths1(dir)
-    replace_sharelib_ldpaths2(dir)
+
+fn replace_exe_script_paths(dir string) {
+
 }
-fn replace_sharelib_ldpaths2(dir string) {
+
+fn replace_sharelib_ldpaths(dir string) DirwalkContext {
+    // replace_sharelib_ldpaths1(dir)
+    return replace_sharelib_ldpaths2(dir)
+}
+fn replace_sharelib_ldpaths2(dir string) DirwalkContext {
     mut spctx := DirwalkContext{}
     spctx.btime = time.now()
 	// mut spctx := 0
@@ -538,6 +654,7 @@ fn replace_sharelib_ldpaths2(dir string) {
         len0 := ctx.binfiles.len
         len1 := ctx.file_cnt
         ctx.prbar.step(len0, len1, "inwalk: ${len0}/${len1} ${os.base(f)}")
+        // vcp.info(len0, len1, "inwalk: ${len0}/${len1} ${os.base(f)}")
 		// replace_sharelib_ldpath(f, ctx.file_cnt)
 	})
     spctx.prbar.end()
@@ -551,6 +668,8 @@ fn replace_sharelib_ldpaths2(dir string) {
     spctx.prbar.end()
     if spctx.binfiles.len>99 { vcp.info("done", len1, dir)}
 	vcp.falseprt(spctx.arch_nerr==0, "binarch not match", spctx.str(), time.since(spctx.btime).str(), dir)
+
+    return spctx
 }
     struct DirwalkContext {
         pub mut:
@@ -558,14 +677,29 @@ fn replace_sharelib_ldpaths2(dir string) {
         file_cnt int
         btime time.Time
         skip bool
+        reason string
         binfiles []string
+        fmetas []FileMeta
         prbar &vcp.TermPrbar = vcp.TermPrbar.new()
     }
+
+struct FileMeta {
+    pub mut:
+    file string
+    meta string
+    islnx bool
+    ismac bool
+    isarm32 bool
+    isarm64 bool
+    isamd64 bool
+    isx86 bool
+    isexescript bool
+}
 
 // todo two slow when many bin/lib, such as emacs's 3000 .eln files
 // todo generate bash script, and batch run
 // bug? maybe this cause memory usage up to 7100M?
-fn replace_sharelib_ldpaths1(dir string) {
+fn replace_sharelib_ldpaths1(dir string) DirwalkContext {
     mut spctx := DirwalkContext{}
     spctx.btime = time.now()
 	// mut spctx := 0
@@ -588,11 +722,15 @@ fn replace_sharelib_ldpaths1(dir string) {
 		if !check_binarch(f) { // addassignop(1, ctx)
             ctx.arch_nerr+=1
 			vcp.info(check_binarch(f), ctx.str(), f)
+            ctx.skip = true
+            return
 		}
 		replace_sharelib_ldpath(f, ctx.file_cnt, 0)
 	})
 	// vcp.info("binarcherr", spctx, dir)
 	vcp.falseprt(spctx.arch_nerr==0, "binarch not match", spctx.str(), time.since(spctx.btime).str(), dir)
+    
+    return spctx
 }
 fn replace_sharelib_ldpath(file string, idx int, tot int) {
 	lines, ok := runcmdv("otool -L ${file}")
@@ -604,7 +742,11 @@ fn replace_sharelib_ldpath(file string, idx int, tot int) {
 	for i:=1; i < lines.len;i++ {
 		line := lines[i].trim_space()
 		if !line.starts_with("/nix/store/") { continue }
+        // 这一行日志输出导致了内存爆涨！！！7G以上。大概在有3000次循环的时候（emacs)
+        // 没有这一行的话，大概内存保持在50M左右不变。
+        // 有可能是获取调用栈的时候的问题？？？
 		vcp.info(i, "need resolve ldpath", line, idx, tot, file)
+        // log.info("${i}, need resolve ldpath, $line, $idx, $tot, $file")
 
 		libpath := line.all_before(" ")
 		libbase := os.base(libpath)
@@ -619,15 +761,79 @@ fn replace_sharelib_ldpath(file string, idx int, tot int) {
 	}
 }
 
+// assume is exe script file, no check
+fn replace_exe_script_ldpath(file string, idx int, tot int) {
+    pfx := "/nix/store"
+    mut edited:= 0
+    mut lines := os.read_lines(file) or {panic(err)}
+    for i:=0;i <lines.len;i++ {
+        mut s := lines[i]
+        if s.len == 0 { continue }
+        if !s.contains(pfx) {
+            continue
+        }
+        edited ++
+        // vcp.info("need replace", s, file)
+        cnt := s.count(pfx)
+        for j :=0; j < cnt && s.contains(pfx); j++ {
+            pos0 := s.index(pfx) or {panic(err)}
+            pos2 := s.index_after("/", pos0+pfx.len+1)
+            t := s.substr(pos0, pos2)
+            // vcp.info(t)
+            s = s.replace(t, "/usr/local")
+            vcp.info(s, file)
+        }
+        lines[i] = s
+    }
+    if edited > 0 {
+        scc := lines.join("\n")
+        os.write_file(file, scc) or { 
+            vcp.info(err.str(), file)
+            // return
+        }
+        // runcmd("head ${file}", "", false)
+        vcp.info(edited, file)
+    }
+}
+
 // Mach-O 64-bit executable x86_64
 fn check_binarch(file string) bool {
 	lines, ok := runcmdv("file ${file}")
 	filety := firstofv(lines)
+    if is_mac_obj(filety) && get_file_cpuarch(filety) == "x86_64" { return true }
 	// vcp.info(filety,  filety.contains("executable"), filety.contains("x86_64") )
-	if filety.contains("Mach-O") && filety.contains("executable") && !filety.contains("x86_64") {
-		return false
-	}
-	return true
+	// if filety.contains("Mach-O") && filety.contains("executable") && !filety.contains("x86_64") {
+	// 	return false
+	// }
+	// return true
+    return false
+}
+
+fn get_file_meta(file string) FileMeta {
+    mut fm := FileMeta{file:file}
+    lines, ok := runcmdv("file ${file}")
+    filety := firstofv(lines)
+    // vcp.info(filety)
+
+    fm.meta = filety
+    fm.islnx = is_linux_elf(filety)
+    fm.ismac = is_mac_obj(filety)
+    fm.isexescript = is_exe_script(filety)
+    cputy := get_file_cpuarch(filety)
+    fm.isamd64 = cputy == "x86_64"
+    fm.isarm64 = cputy == "aarch64"
+
+    return fm
+}
+fn (fm FileMeta) isarm() bool { return fm.isarm64 || fm.isarm32 }
+fn (fm FileMeta) isamd() bool { return fm.isx86 || fm.isamd64 }
+fn (fm FileMeta) isexe() bool { return fm.islnx || fm.ismac || fm.isexescript }
+fn (fm FileMeta) isbinexe() bool { return fm.islnx || fm.ismac }
+fn (fm FileMeta) str0() string {
+    ismac := fm.ismac.toc()
+    isamd := fm.isamd().toc()
+    isexe := fm.isexe().toc()
+    return "mac:${ismac},x64:${isamd},exe:${isexe}"
 }
 
 // line: /nix/store/imhzscw3r1rd6x40ddc5wwknwdsz6x5r-par2cmdline-0.8.1
