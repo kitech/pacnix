@@ -226,7 +226,7 @@ fn main() {
 
 	maxoptno := 30
 	for i, line in rcvals {
-		vcp.info(i, "\t", line)
+		vcp.info(i.str(), "\t", line.clone())
 		if i > maxoptno { break}
 	}
 	vcp.trueprt(rcvals.len>maxoptno, "too many matches", rcvals.len, pkgname, "file size:", os.file_size(store_path_file))
@@ -745,7 +745,7 @@ fn replace_sharelib_ldpath(file string, idx int, tot int) {
         // 这一行日志输出导致了内存爆涨！！！7G以上。大概在有3000次循环的时候（emacs)
         // 没有这一行的话，大概内存保持在50M左右不变。
         // 有可能是获取调用栈的时候的问题？？？
-		vcp.info(i, "need resolve ldpath", line, idx, tot, file)
+		vcp.info(i.str(), "need resolve ldpath", line, idx, tot, file)
 
 		libpath := line.all_before(" ")
 		libbase := os.base(libpath)
@@ -924,7 +924,7 @@ fn get_match_store_paths_linebyline(store_path_file string, kw string) []string{
 		// vcp.info(i, line.len, line, kw)
 		// vcp.info(i, rn, buf.len, line.len, line)
 		if line.len>0 && line.contains(kw) && line != "" {
-			vcp.info("got???", i, line.len, line)
+			vcp.info("got???", i.str(), line.len, line)
 			rcvals << line
 		}
 	}
